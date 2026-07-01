@@ -1,0 +1,11 @@
+[package]
+name = "onchain-zkml-circuit"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[build-dependencies]
+risc0-build = { path = "../../risc0/risc0/build" }
+
+[package.metadata.risc0]
+methods = ["guest"]

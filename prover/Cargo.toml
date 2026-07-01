@@ -1,0 +1,17 @@
+[package]
+name = "onchain-zkml-prover"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+onchain-zkml-engine = { path = "../engine" }
+onchain-zkml-circuit = { path = "../circuit" }
+risc0-zkvm = { path = "../../risc0/risc0/zkvm", features = ["prove"] }
+borsh = "1"
+serde_json = "1"
+hex = "0.4"
+
+[[bin]]
+name = "prove"
+path = "src/main.rs"

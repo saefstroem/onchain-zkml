@@ -1,0 +1,15 @@
+[package]
+name = "onchain-zkml-guest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "transition"
+path = "src/bin/transition.rs"
+
+[dependencies]
+risc0-zkvm = { path = "../../../risc0/risc0/zkvm", default-features = false, features = ["std"] }
+onchain-zkml-engine = { path = "../../engine" }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
