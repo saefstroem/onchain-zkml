@@ -33,7 +33,10 @@ fn norm_f32(at: usize) -> Result<f32> {
 pub fn feature_count() -> Result<usize> {
     Ok(u16::from_le_bytes([*NORM.get(0).ok_or(Error::Net)?, *NORM.get(1).ok_or(Error::Net)?]) as usize)
 }
-
+/// The formula (x - mean) / std 
+/// is exactly the z-score: it centers each feature 
+/// by subtracting the mean and scales by the standard deviation, 
+/// so the transformed feature has mean 0 and std 1 across the training distribution.
 pub fn standardize(features: &[f32]) -> Result<Vec<f32>> {
     let n = feature_count()?;
     if features.len() != n {

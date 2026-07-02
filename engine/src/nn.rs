@@ -42,15 +42,20 @@ pub fn layer_count() -> Result<usize> {
     Ok(parse(NET)?.len())
 }
 
+/// A forward pass through one dense layer
 pub fn dense_forward(input: &[f32], layer: &Layer) -> Result<Vec<f32>> {
     if input.len() != layer.in_dim {
         return Err(Error::Shape);
     }
     let mut out = Vec::with_capacity(layer.out_dim);
+    // for each output neuron
     for j in 0..layer.out_dim {
+        // seed the accumulator with this neuron's bias
         let mut acc = *layer.bias.get(j).ok_or(Error::Shape)?;
         for (i, x) in input.iter().enumerate() {
+            // weight linking input i to neuron j (row-major: j*in_dim + i)
             let w = *layer.weights.get(j * layer.in_dim + i).ok_or(Error::Shape)?;
+            // compute the output 
             acc += w * x;
         }
         if layer.relu && acc < 0.0 {
