@@ -1,94 +1,56 @@
 use risc0_zkvm::sha::{Digest, Digestible};
 use risc0_zkvm::{default_prover, ExecutorEnv, ProverOpts};
 use std::env as stdenv;
-use std::fs;
 use std::process::exit;
 use onchain_zkml_circuit::{TRANSITION_ELF, TRANSITION_ID};
-use onchain_zkml_engine::{forward, journal, layer_count, Witness};
+use onchain_zkml_engine::{
+    feature_count, forward, journal, layer_count, standardize, target_stats, to_bytes_f32, Witness,
+};
 
-struct Norm {
-    mean: Vec<f32>,
-    std: Vec<f32>,
-    y_mean: f32,
-    y_std: f32,
-}
-
-fn f32_at(bytes: &[u8], at: usize) -> f32 {
-    f32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-}
-
-fn parse_norm(bytes: &[u8]) -> Norm {
-    let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-    let mean = (0..count).map(|i| f32_at(bytes, 2 + i * 4)).collect();
-    let std = (0..count).map(|i| f32_at(bytes, 2 + count * 4 + i * 4)).collect();
-    let y_mean = f32_at(bytes, 2 + count * 8);
-    let y_std = f32_at(bytes, 2 + count * 8 + 4);
-    Norm { mean, std, y_mean, y_std }
-}
-
-fn read_norm() -> Norm {
-    let bytes = fs::read("norm.bin").unwrap_or_else(|_| {
-        eprintln!("norm.bin not found, run: python3 model/train_dense.py");
-        exit(1);
-    });
-    parse_norm(&bytes)
-}
-
-fn to_dollars(price: i16, norm: &Norm) -> f32 {
-    f32::from(price) / 256.0 * norm.y_std + norm.y_mean
-}
-
-fn quantize(features: &[f64], norm: &Norm) -> Vec<i16> {
-    if features.len() != norm.mean.len() {
-        eprintln!("expected {} features, got {}", norm.mean.len(), features.len());
-        exit(1);
-    }
-    features
-        .iter()
-        .enumerate()
-        .map(|(i, x)| (((*x as f32 - norm.mean[i]) / norm.std[i]) * 256.0).round().clamp(-32768.0, 32767.0) as i16)
-        .collect()
+fn to_dollars(prediction: f32, y_mean: f32, y_std: f32) -> f32 {
+    prediction * y_std + y_mean
 }
 
 fn main() {
     let args: Vec<String> = stdenv::args().collect();
     let layer: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let norm = read_norm();
     let count = layer_count().expect("net.bin is malformed");
     if layer >= count {
         eprintln!("layer {layer} out of range (net has {count} layers)");
         exit(1);
     }
-    let input: Vec<i16> = match args.get(2) {
-        Some(csv) if layer == 0 => {
-            let features: Vec<f64> =
-                csv.split(',').map(|s| s.trim().parse().expect("features must be numbers")).collect();
-            quantize(&features, &norm)
-        }
+
+    let raw: Vec<f32> = match args.get(2) {
         Some(csv) => csv
             .split(',')
             .map(|s| {
-                s.trim().parse::<i16>().unwrap_or_else(|_| {
-                    eprintln!("layer {layer} input must be integers (layer {}'s output), got '{}'", layer - 1, s.trim());
+                s.trim().parse::<f32>().unwrap_or_else(|_| {
+                    eprintln!("input must be numbers, got '{}'", s.trim());
                     exit(1);
                 })
             })
             .collect(),
-        None => vec![0i16; norm.mean.len()],
+        None => vec![0.0f32; feature_count().expect("norm.bin is malformed")],
     };
 
+    let input = if layer == 0 {
+        standardize(&raw).expect("standardize failed")
+    } else {
+        raw.clone()
+    };
     let output = forward(&input, layer).expect("layer forward failed");
+    let input_bytes = to_bytes_f32(&raw);
+
     let last = layer + 1 == count;
-    let dollars = last.then(|| {
-        let price = output.first().copied().unwrap_or(0);
-        to_dollars(price, &norm)
-    });
+    let (y_mean, y_std) = target_stats().expect("norm.bin is malformed");
+    let dollars = last.then(|| to_dollars(output.first().copied().unwrap_or(0.0), y_mean, y_std));
     match dollars {
         Some(d) => eprintln!("layer {layer} of {count}: predicted price ${d:.0}"),
         None => eprintln!("layer {layer} of {count}: output {output:?}"),
     }
 
-    let witness = Witness { input: input.clone(), layer: layer as u8 };
+    let record = journal(&output, &input_bytes);
+    let witness = Witness { input: raw, layer: layer as u8 };
     let env = ExecutorEnv::builder().write(&witness).unwrap().build().unwrap();
     let receipt = default_prover()
         .prove_with_opts(env, TRANSITION_ELF, &ProverOpts::succinct())
@@ -108,13 +70,13 @@ fn main() {
     let control_index = succinct.control_inclusion_proof.index.to_le_bytes();
     let mut image = [0u8; 32];
     image.copy_from_slice(Digest::from(TRANSITION_ID).as_bytes());
-    let record = journal(&output, &input);
 
     let report = serde_json::json!({
         "layer": layer,
         "final": last,
         "priceUsd": dollars,
         "output": output,
+        "inputHex": hex::encode(&input_bytes),
         "hashFn": "poseidon2",
         "imageId": hex::encode(image),
         "controlId": hex::encode(succinct.control_id.as_bytes()),
@@ -132,14 +94,15 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn demo_norm() -> Norm {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../norm.bin");
-        parse_norm(&fs::read(path).expect("norm.bin missing"))
-    }
-
     #[test]
-    fn scaled_output_converts_back_to_dollars() {
-        let norm = demo_norm();
-        println!("{}",to_dollars(6602, &norm));
+    fn standardized_output_converts_back_to_dollars() {
+        let (y_mean, y_std) = target_stats().expect("norm.bin is malformed");
+        println!("y_mean = {y_mean:.2} USD, y_std = {y_std:.2} USD");
+        for pred in [-1.0f32, -0.2, 0.0, 1.0, 2.0] {
+            println!("standardized {pred:+.4} -> ${:.0}", to_dollars(pred, y_mean, y_std));
+        }
+        assert!((to_dollars(0.0, y_mean, y_std) - y_mean).abs() < 1.0);
+        assert!(to_dollars(1.0, y_mean, y_std) > y_mean);
+        assert!(to_dollars(-1.0, y_mean, y_std) < y_mean);
     }
 }

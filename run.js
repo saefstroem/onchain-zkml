@@ -90,8 +90,8 @@ const OP_CAT = "7e";
 const OP_SHA256 = "a8";
 
 function covenant(proof) {
-  const outputHex = proof.journal.slice(0, proof.output.length * 4);
-  const inputHashHex = proof.journal.slice(proof.output.length * 4);
+  const outputHex = proof.journal.slice(0, proof.output.length * 8);
+  const inputHashHex = proof.journal.slice(proof.output.length * 8);
 
   const verifier = ZkScriptBuilder.newR0({ flags: { covenantsEnabled: true } });
   verifier.appendR0SuccinctVerifier(proof.imageId, proof.controlId, proof.hashFn);
@@ -142,13 +142,18 @@ async function settle(rpc, proof, dryRun) {
   const journalDigest = createHash("sha256").update(Buffer.from(proof.journal, "hex")).digest("hex");
   const priceNote = proof.priceUsd == null ? "" : `  price $${Math.round(proof.priceUsd)}`;
 
-  const outHex = proof.journal.slice(0, proof.output.length * 4);
-  const inputHashHex = proof.journal.slice(proof.output.length * 4);
+  const outHex = proof.journal.slice(0, proof.output.length * 8);
+  const inputHashHex = proof.journal.slice(proof.output.length * 8);
 
   console.log(`layer ${proof.layer}${proof.final ? " (final)" : ""}: output [${proof.output.join(", ")}]${priceNote}`);
-  console.log(`  on-chain output (${proof.output.length} x i16 LE): ${outHex}`);
-  console.log(`  on-chain input hash:    ${inputHashHex}`);
-  console.log(`  journal digest : ${journalDigest}`);
+  console.log("")
+  console.log("")
+  console.log("")
+  console.log("")
+  console.log(`on-chain output (${proof.output.length} x f32 LE): ${outHex}`);
+  console.log(`input (f32 LE, hashed): ${proof.inputHex}`);
+  console.log(`on-chain input hash: ${inputHashHex}`);
+  console.log(`journal digest: ${journalDigest}`);
 
   const { entries } = await rpc.getUtxosByAddresses({ addresses: [address] });
   if (!entries.length) {
@@ -164,7 +169,8 @@ async function settle(rpc, proof, dryRun) {
   const fee = computed > FEE_FLOOR ? computed : FEE_FLOOR;
   const value = amount - fee;
   const txObj = makeTx(utxo, finalized, value, dest);
-  console.log(` reroute ${value} -> treasury ${PAYOUT}`);
+  console.log("")
+  console.log(`reroute ${value} -> treasury ${PAYOUT}`);
 
   if (dryRun) {
     show("  tx", txObj);
@@ -173,7 +179,7 @@ async function settle(rpc, proof, dryRun) {
   const tx = new Transaction(txObj);
   for (const inp of tx.inputs) inp.computeBudget = COMPUTE_BUDGET;
   const { transactionId } = await rpc.submitTransaction({ transaction: tx, allowOrphan: false });
-  console.log(`  settled tx ${transactionId}`);
+  console.log(`settled tx ${transactionId}`);
   return true;
 }
 
@@ -211,7 +217,7 @@ async function main() {
   const proof = proveLayer(to, layerInput);
   const outFile = `layer${to}.out`;
   writeFileSync(join(ROOT, outFile), proof.output.join(",") + "\n");
-  console.log(`  saved ${outFile} — next: --from-layer-idx=${to} --to-layer-idx=${to + 1} --layer-input=${outFile}`);
+  console.log(`saved ${outFile}`);
   await settle(rpc, proof, DRY_RUN);
   await rpc.disconnect();
 }
