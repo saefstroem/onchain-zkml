@@ -140,6 +140,6 @@ mod tests {
     #[test]
     fn scaled_output_converts_back_to_dollars() {
         let norm = demo_norm();
-        println!("{}",to_dollars(1, &norm));
+        println!("{}",to_dollars(6602, &norm));
     }
 }
