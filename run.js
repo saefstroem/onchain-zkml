@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -18,12 +18,21 @@ import init, {
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const ARGS = process.argv.slice(2);
-const MODE = ARGS.find((a) => a === "address" || a === "--dry-run");
+const flag = (name) => {
+  const pref = `--${name}=`;
+  const a = ARGS.find((x) => x.startsWith(pref));
+  return a ? a.slice(pref.length) : null;
+};
+const IS_ADDRESS = ARGS.includes("address");
+const DRY_RUN = ARGS.includes("--dry-run");
+const FROM = flag("from-layer-idx");
+const TO = flag("to-layer-idx");
+const LAYER_INPUT_FILE = flag("layer-input");
+
 const TREASURY = "kaspatest:qz9agq5pr6yrnrxh3m5ure9yy0eggwup9jjhp32zw8zknmfkqunf7c9tt5x6u";
 const NETWORK = "testnet-10";
 const RPC_URL = "wss://tn10.stroem.finance";
 const PAYOUT = TREASURY;
-const LAYERS = 1;
 const COMPUTE_BUDGET = 2550;
 const COMPUTE_MASS = 500000n;
 const COMPUTE_FEERATE = 100n;
@@ -68,27 +77,40 @@ async function askFeatures() {
   return values.join(",");
 }
 
-function proveLayer(layer, features) {
+function proveLayer(layer, layerInput) {
   const args = ["run", "--release", "-q", "-p", "onchain-zkml-prover", "--", String(layer)];
-  if (features) {
-    args.push(features);
+  if (layerInput) {
+    args.push(layerInput);
   }
   const stdout = execFileSync("cargo", args, { cwd: ROOT, maxBuffer: 64 * 1024 * 1024 });
   return JSON.parse(stdout.toString());
 }
 
+const OP_CAT = "7e";
+const OP_SHA256 = "a8";
+
 function covenant(proof) {
-  const journalDigest = createHash("sha256").update(Buffer.from(proof.journal, "hex")).digest();
-  const builder = ZkScriptBuilder.newR0({ flags: { covenantsEnabled: true } });
-  builder.commitToSuccinct(proof.imageId, proof.controlId, proof.hashFn);
-  return builder.finalizeWithSuccinctProof(proof.receipt, journalDigest);
+  const outputHex = proof.journal.slice(0, proof.output.length * 4);
+  const inputHashHex = proof.journal.slice(proof.output.length * 4);
+
+  const verifier = ZkScriptBuilder.newR0({ flags: { covenantsEnabled: true } });
+  verifier.appendR0SuccinctVerifier(proof.imageId, proof.controlId, proof.hashFn);
+  const redeemScript = OP_CAT + OP_SHA256 + verifier.drain();
+
+  const sig = ZkScriptBuilder.newR0({ flags: { covenantsEnabled: true } });
+  sig.pushR0SuccinctWitness(proof.receipt);
+  sig.addData(outputHex);
+  sig.addData(inputHashHex);
+  sig.addData(redeemScript);
+
+  return { sigScript: sig.drain(), redeemScript };
 }
 
 function depositAddress(redeemScript) {
   return addressFromScriptPublicKey(payToScriptHashScript(redeemScript), NETWORK).toString();
 }
 
-function makeTx(utxo, finalized, outValue) {
+function makeTx(utxo, finalized, outValue, destScript) {
   return {
     version: 1,
     inputs: [
@@ -101,7 +123,7 @@ function makeTx(utxo, finalized, outValue) {
         utxo,
       },
     ],
-    outputs: [{ value: outValue, scriptPublicKey: payToAddressScript(PAYOUT) }],
+    outputs: [{ value: outValue, scriptPublicKey: destScript }],
     lockTime: 0n,
     subnetworkId: "0000000000000000000000000000000000000000",
     gas: 0n,
@@ -115,24 +137,35 @@ function show(label, value) {
 
 async function settle(rpc, proof, dryRun) {
   const finalized = covenant(proof);
-  const address = depositAddress(finalized.redeemScript);
-  const priceNote = proof.priceUsd == null ? "" : ` (price $${Math.round(proof.priceUsd)})`;
-  console.log(`layer ${proof.layer}${priceNote}: deposit P2SH ${address}`);
+  const p2sh = payToScriptHashScript(finalized.redeemScript);
+  const address = addressFromScriptPublicKey(p2sh, NETWORK).toString();
+  const journalDigest = createHash("sha256").update(Buffer.from(proof.journal, "hex")).digest("hex");
+  const priceNote = proof.priceUsd == null ? "" : `  price $${Math.round(proof.priceUsd)}`;
+
+  const outHex = proof.journal.slice(0, proof.output.length * 4);
+  const inputHashHex = proof.journal.slice(proof.output.length * 4);
+
+  console.log(`layer ${proof.layer}${proof.final ? " (final)" : ""}: output [${proof.output.join(", ")}]${priceNote}`);
+  console.log(`  on-chain output (${proof.output.length} x i16 LE): ${outHex}`);
+  console.log(`  on-chain input hash:    ${inputHashHex}`);
+  console.log(`  journal digest : ${journalDigest}`);
+
   const { entries } = await rpc.getUtxosByAddresses({ addresses: [address] });
   if (!entries.length) {
-    console.log(`layer ${proof.layer}: no funds at ${address} — deposit TKAS and rerun`);
     return false;
   }
   const utxo = entries.reduce((a, b) => (BigInt(a.amount) >= BigInt(b.amount) ? a : b));
   const amount = BigInt(utxo.amount);
-  const sizing = makeTx(utxo, finalized, amount);
+  const dest = payToAddressScript(PAYOUT);
+  const sizing = makeTx(utxo, finalized, amount, dest);
   const sizeMass = calculateTransactionMass(NETWORK, sizing);
   const mass = COMPUTE_MASS > sizeMass ? COMPUTE_MASS : sizeMass;
   const computed = mass * COMPUTE_FEERATE;
   const fee = computed > FEE_FLOOR ? computed : FEE_FLOOR;
   const value = amount - fee;
-  const txObj = makeTx(utxo, finalized, value);
-  console.log(`layer ${proof.layer}: ${amount} sompi at ${address}; fee ${fee}; reroute ${value} -> ${PAYOUT}`);
+  const txObj = makeTx(utxo, finalized, value, dest);
+  console.log(` reroute ${value} -> treasury ${PAYOUT}`);
+
   if (dryRun) {
     show("  tx", txObj);
     return true;
@@ -140,28 +173,46 @@ async function settle(rpc, proof, dryRun) {
   const tx = new Transaction(txObj);
   for (const inp of tx.inputs) inp.computeBudget = COMPUTE_BUDGET;
   const { transactionId } = await rpc.submitTransaction({ transaction: tx, allowOrphan: false });
-  console.log(`  settled tx ${transactionId} journal ${proof.journal.slice(0, 16)}…`);
+  console.log(`  settled tx ${transactionId}`);
   return true;
 }
 
 async function main() {
   await init({ module_or_path: readFileSync(join(ROOT, "kaspa", "kaspa_bg.wasm")) });
 
-  if (MODE === "address") {
+  if (IS_ADDRESS) {
     console.log(depositAddress(covenant(proveLayer(0)).redeemScript));
     return;
   }
 
-  const features = await askFeatures();
+  const from = Number(FROM);
+  const to = Number(TO);
+  if (FROM == null || TO == null || !Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0) {
+    console.error("usage:");
+    console.error("  node run.js --from-layer-idx=<n> --to-layer-idx=<m> [--layer-input=<file>] [--dry-run]");
+    console.error("  node run.js address");
+    console.error("proves + settles layer <m>, using layer <n>'s saved output (--layer-input) or the prompted features");
+    process.exit(1);
+  }
+
+  let layerInput;
+  if (LAYER_INPUT_FILE) {
+    layerInput = readFileSync(join(ROOT, LAYER_INPUT_FILE), "utf8").trim();
+    console.log(`layer ${to} input: ${LAYER_INPUT_FILE} (layer ${from} output, ${layerInput.split(",").length} values)`);
+  } else if (to === 0) {
+    layerInput = await askFeatures();
+  } else {
+    console.error(`layer ${to} needs --layer-input=layer${to - 1}.out (the feature prompt only feeds layer 0)`);
+    process.exit(1);
+  }
+
   const rpc = new RpcClient({ url: RPC_URL, encoding: Encoding.Borsh, networkId: NETWORK });
   await rpc.connect();
-  let layerInput = features;
-  for (let layer = 0; layer < LAYERS; layer++) {
-    const proof = proveLayer(layer, layerInput);
-    const ok = await settle(rpc, proof, MODE === "--dry-run");
-    if (!ok) break;
-    layerInput = proof.output.join(",");
-  }
+  const proof = proveLayer(to, layerInput);
+  const outFile = `layer${to}.out`;
+  writeFileSync(join(ROOT, outFile), proof.output.join(",") + "\n");
+  console.log(`  saved ${outFile} — next: --from-layer-idx=${to} --to-layer-idx=${to + 1} --layer-input=${outFile}`);
+  await settle(rpc, proof, DRY_RUN);
   await rpc.disconnect();
 }
 

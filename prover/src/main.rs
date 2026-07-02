@@ -17,17 +17,25 @@ fn f32_at(bytes: &[u8], at: usize) -> f32 {
     f32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
+fn parse_norm(bytes: &[u8]) -> Norm {
+    let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    let mean = (0..count).map(|i| f32_at(bytes, 2 + i * 4)).collect();
+    let std = (0..count).map(|i| f32_at(bytes, 2 + count * 4 + i * 4)).collect();
+    let y_mean = f32_at(bytes, 2 + count * 8);
+    let y_std = f32_at(bytes, 2 + count * 8 + 4);
+    Norm { mean, std, y_mean, y_std }
+}
+
 fn read_norm() -> Norm {
     let bytes = fs::read("norm.bin").unwrap_or_else(|_| {
         eprintln!("norm.bin not found, run: python3 model/train_dense.py");
         exit(1);
     });
-    let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-    let mean = (0..count).map(|i| f32_at(&bytes, 2 + i * 4)).collect();
-    let std = (0..count).map(|i| f32_at(&bytes, 2 + count * 4 + i * 4)).collect();
-    let y_mean = f32_at(&bytes, 2 + count * 8);
-    let y_std = f32_at(&bytes, 2 + count * 8 + 4);
-    Norm { mean, std, y_mean, y_std }
+    parse_norm(&bytes)
+}
+
+fn to_dollars(price: i16, norm: &Norm) -> f32 {
+    f32::from(price) / 256.0 * norm.y_std + norm.y_mean
 }
 
 fn quantize(features: &[f64], norm: &Norm) -> Vec<i16> {
@@ -59,7 +67,12 @@ fn main() {
         }
         Some(csv) => csv
             .split(',')
-            .map(|s| s.trim().parse().expect("layer input must be integers"))
+            .map(|s| {
+                s.trim().parse::<i16>().unwrap_or_else(|_| {
+                    eprintln!("layer {layer} input must be integers (layer {}'s output), got '{}'", layer - 1, s.trim());
+                    exit(1);
+                })
+            })
             .collect(),
         None => vec![0i16; norm.mean.len()],
     };
@@ -68,7 +81,7 @@ fn main() {
     let last = layer + 1 == count;
     let dollars = last.then(|| {
         let price = output.first().copied().unwrap_or(0);
-        f32::from(price) / 256.0 * norm.y_std + norm.y_mean
+        to_dollars(price, &norm)
     });
     match dollars {
         Some(d) => eprintln!("layer {layer} of {count}: predicted price ${d:.0}"),
@@ -113,4 +126,20 @@ fn main() {
         "receipt": hex::encode(&receipt_bytes),
     });
     println!("{report}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demo_norm() -> Norm {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../norm.bin");
+        parse_norm(&fs::read(path).expect("norm.bin missing"))
+    }
+
+    #[test]
+    fn scaled_output_converts_back_to_dollars() {
+        let norm = demo_norm();
+        println!("{}",to_dollars(1, &norm));
+    }
 }
